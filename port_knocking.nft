@@ -1,0 +1,88 @@
+#!/usr/sbin/nft -f
+
+# Project port_knocking
+# # https://github.com/userprof/nftables/port_knocking.nft
+# # MIT license 
+# # https://github.com/userprof/nftables/blob/main/LICENSE
+
+
+# ✏️  Set the real port knock - don't select service ports
+define rkport_1 = 6735
+define rkport_2 = 10057
+define rkport_3 = 3265
+define rkport_4 = 7747
+define rkport_5 = 9999
+
+# ✏️  Set Honypot port ( change number +- 1 about to rkport )
+define hkport_1 = { 6734, 6736 }    # NOT 6735
+define hkport_2 = { 10056, 10058 }  # NOT 10057
+define hkport_3 = { 3264, 3267 }    # NOT 3265
+define hkport_4 = { 7746, 7748 }    # NOT 7747
+define hkport_5 = { 9998, 10000 }   # NOT 9999
+
+# ✏️  Set number mark autorized users
+define num_mark = 483
+
+# ✏️  Set mesage text to log
+define log_ok  = "KNOCK_SUCCESS: "
+
+# ✏️  Set rule allowing authorized users ( Check the table name and chain name ❗️)
+insert rule ip filter INPUT icmp type echo-request mark $num_mark counter accept comment "input ACCEPT icmp RESERVE MANAGE"
+insert rule ip filter INPUT tcp dport 22 mark $num_mark counter accept comment "input ACCEPT ssh RESERVE MANAGE"
+
+
+# Group listing rkport (Real knocking port) and hkports ( Honypot port )
+define rkports = { $rkport_1, $rkport_2, $rkport_3, $rkport_4, $rkport_5 }
+define hkports = { $hkport_1, $hkport_2, $hkport_3, $hkport_4, $hkport_5 }
+define all_kports = { $rkports, $hkports }
+
+table ip raw {
+    # Parameter sets knocking
+    set knocking_stages { type ipv4_addr . inet_service; size 30; flags dynamic,timeout; timeout 3s; }
+    set authorized { type ipv4_addr; size 50; flags timeout; comment "✅ Authorized users"; timeout 15m; }   # ✏️  Set time autorized users ip ( default 15m )
+    # Parameter sets protected
+    set monitor_ddos { type ipv4_addr; size 30000; flags dynamic,timeout; timeout 40s; }  #  Time control monitor ( default 40s for 5 knock )
+    set monitor_hony { type ipv4_addr; size 30000; flags dynamic,timeout; timeout 40s; }  #  Time control monitor ( default 40s for 5 knock )
+    set banned_ddos { type ipv4_addr; size 10000; flags timeout; comment "❌️ DDoS users"; timeout 5m; }      # ✏️  Set time ban ip ( default 5m )
+    set banned_hony { type ipv4_addr; size 10000; flags timeout; comment "❌️ Honeypot users"; timeout 5m; }  # ✏️  Set time ban ip ( default 5m )
+
+
+    chain PREROUTING {
+        type filter hook prerouting priority -300; policy accept
+
+        # Mark accept authorized users
+        ip saddr @authorized meta mark set $num_mark
+
+        # Banned DDoS or Honeypot users, only all_kport port
+        ip saddr @banned_ddos tcp dport $all_kports counter drop
+        ip saddr @banned_hony tcp dport $all_kports counter drop
+
+        # Send legitimate syn packages the PROCESSING chain 
+        fib daddr type local ip saddr != @authorized tcp dport $all_kports tcp flags & (syn|ack) == syn ip length 44-80 tcp doff 6-15 goto PROCESSING
+    }
+
+    chain PROCESSING {
+
+        # Controlled in packeges testing ( default disable )  ✏️
+#        tcp dport $all_kports log prefix "TEST_KNOCK" counter
+
+        # Protection from DDoS - using rate package
+        tcp dport { $hkports, $rkport_2, $rkport_3, $rkport_4, $rkport_5 } update @monitor_ddos { ip saddr limit rate over 10/minute burst 5 packets } update @banned_ddos { ip saddr } drop
+
+        # Protection from Honeypot  (select one variables)   ❗️
+        # Method 1 base only port hony
+        tcp dport { $hkports } update @banned_hony { ip saddr } drop
+        # Method 2 agressive - calc package ( normal syn package = 60 bytes)
+#        tcp dport { $hkports, $rkport_2, $rkport_3, $rkport_4, $rkport_5 } update @monitor_hony { ip saddr quota over 325 bytes } update @banned_hony { ip saddr } drop
+
+        # Logic port knock
+        tcp dport $rkport_1 add @knocking_stages { ip saddr . $rkport_2 } delete @knocking_stages { ip saddr . $rkport_1 } counter drop
+        tcp dport $rkport_2 ip saddr . tcp dport @knocking_stages add @knocking_stages { ip saddr . $rkport_3 } delete @knocking_stages { ip saddr . $rkport_2 } counter drop
+        tcp dport $rkport_3 ip saddr . tcp dport @knocking_stages add @knocking_stages { ip saddr . $rkport_4 } delete @knocking_stages { ip saddr . $rkport_3 } counter drop
+        tcp dport $rkport_4 ip saddr . tcp dport @knocking_stages add @knocking_stages { ip saddr . $rkport_5 } delete @knocking_stages { ip saddr . $rkport_4 } counter drop
+        tcp dport $rkport_5 ip saddr . tcp dport @knocking_stages add @authorized { ip saddr } delete @knocking_stages { ip saddr . $rkport_5 } log prefix "$log_ok" counter drop
+
+        # Protection from Poison Pill
+        tcp dport $all_kports counter drop
+    }
+}
